@@ -18,6 +18,15 @@ const dnsPort = "53"
 const dnsServer = "223.5.5.5"
 
 func resolveHostname(name string, port uint16) (resolvedEndpoint *Endpoint, err error) {
+	const dnsPort = "53"
+	const dnsServer = "223.5.5.5"
+
+	// 修复建议：优先判断 name 是否为 IP 地址，若为 IP 则直接返回
+	ip := net.ParseIP(name)
+	if ip != nil {
+		return &Endpoint{Host: ip.String(), Port: port}, nil
+	}
+
 	maxTries := 10
 	if services.StartedAtBoot() {
 		maxTries *= 3
