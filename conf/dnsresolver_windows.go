@@ -8,8 +8,6 @@ package conf
 import (
 	"encoding/json"
 	"fmt"
-	//"github.com/miekg/dns"
-	//"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/services"
 	"net"
 	"net/http"
@@ -22,12 +20,12 @@ type dnsAnswer struct {
 	Data string `json:"data"`
 	Type int    `json:"type"`
 }
+
 type dnsResponse struct {
 	Answer []dnsAnswer `json:"Answer"`
 }
 
 func resolveHostname(name string, port uint16) (resolvedEndpoint *Endpoint, err error) {
-	// 优先判断 name 是否为 IP 地址，若为 IP 则直接返回
 	ip := net.ParseIP(name)
 	if ip != nil {
 		return &Endpoint{Host: ip.String(), Port: port}, nil
@@ -50,22 +48,40 @@ func resolveHostname(name string, port uint16) (resolvedEndpoint *Endpoint, err 
 }
 
 func resolveHostnameOnce(name string, port uint16) (resolvedEndpoint *Endpoint, err error) {
-	ip, err := dohResolve(name, "A")
-	if err == nil && ip != "" {
-		return &Endpoint{Host: ip, Port: port}, nil
+	// Query A records
+	aRecords, errA := dohResolveAll(name, "A")
+	if errA == nil && len(aRecords) > 0 {
+		return &Endpoint{Host: aRecords[0], Port: port}, nil
 	}
-	ip6, err := dohResolve(name, "AAAA")
-	if err == nil && ip6 != "" {
-		return &Endpoint{Host: ip6, Port: port}, nil
+
+	// Query AAAA records
+	aaaaRecords, errAAAA := dohResolveAll(name, "AAAA")
+	if errAAAA == nil && len(aaaaRecords) > 0 {
+		for _, addr := range aaaaRecords {
+			ip := net.ParseIP(addr)
+			// Check for IP4P (Teredo-like) format: 2001:0000::/32 or similar custom mapping
+			if ip != nil && len(ip) == net.IPv6len &&
+				ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3] == 0x00 {
+
+				// Extract port (bytes 10,11)
+				ipPort := (uint16(ip[10]) << 8) | uint16(ip[11])
+				// Extract IPv4 (bytes 12~15)
+				v4Addr := net.IPv4(ip[12], ip[13], ip[14], ip[15])
+				return &Endpoint{Host: v4Addr.String(), Port: ipPort}, nil
+			}
+		}
+		// If no IP4P, just return the first AAAA as IPv6
+		return &Endpoint{Host: aaaaRecords[0], Port: port}, nil
 	}
+
 	return nil, fmt.Errorf("no A or AAAA records found for %s", name)
 }
 
-func dohResolve(name string, qtype string) (string, error) {
+func dohResolveAll(name string, qtype string) ([]string, error) {
 	client := &http.Client{Timeout: 5 * time.Second}
 	req, err := http.NewRequest("GET", dohURL, nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	q := req.URL.Query()
 	q.Add("name", name)
@@ -74,21 +90,22 @@ func dohResolve(name string, qtype string) (string, error) {
 	req.Header.Set("accept", "application/dns-json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	var dr dnsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&dr); err != nil {
-		return "", err
+		return nil, err
 	}
+	var results []string
 	for _, ans := range dr.Answer {
 		// A=1, AAAA=28
 		if (qtype == "A" && ans.Type == 1) || (qtype == "AAAA" && ans.Type == 28) {
-			return ans.Data, nil
+			results = append(results, ans.Data)
 		}
 	}
-	return "", fmt.Errorf("no %s record found", qtype)
+	return results, nil
 }
 
 func (config *Config) ResolveEndpoints() error {
